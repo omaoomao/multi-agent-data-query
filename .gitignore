@@ -1,0 +1,72 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+MANIFEST
+
+# ===== 虚拟环境 =====
+venv/
+env/
+ENV/
+.venv/
+
+
+# ===== 数据库文件（含用户隐私数据）=====
+*.db
+*.sqlite
+*.sqlite3
+
+# ===== API Key / 环境变量（不上传密钥）=====
+.env
+.env.local
+.env.*.local
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== Claude Code =====
+.claude/
+
+# ===== pip 残留 =====
+=0.4.0
+
+# ===== 外部参考项目 =====
+learn-claude-code-main/
+
+# ===== 日志 =====
+*.log
+
+# ===== 向量数据库 =====
+data/chroma_db/
+
+# ===== 对话转录 =====
+.transcripts/
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== 测试覆盖率 =====
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+nosetests.xml
+coverage.xml
+
+# ===== 实验日志 =====
+swanlab/

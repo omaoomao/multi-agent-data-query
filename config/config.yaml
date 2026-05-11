@@ -1,0 +1,33 @@
+# 大模型配置
+llm:
+  provider: "dashscope"
+  model: "qwen-turbo-latest"
+  api_key: "${DASHSCOPE_API_KEY}"
+  temperature: 0.1
+  max_tokens: 2048
+
+# 数据库配置
+database:
+  path: "./data/school_demo.db"
+
+# NL2SQL配置
+nl2sql:
+  num_examples: 3   # Few-shot示例数量
+
+# 记忆配置
+memory:
+  chroma_path: "./data/chroma_db"  # ChromaDB 向量数据库路径
+  max_knowledge_per_user: 100  # 每用户知识条目上限
+  short_term_max_tokens: 1000  # 短期记忆最大token数
+  compression_threshold: 10  # 超过10条消息开始压缩
+  auto_extract_knowledge: true  # 会话中自动提取知识
+
+# 联网搜索配置（DeepSearch）
+search:
+  tavily_api_key: "${TAVILY_API_KEY}"  # Tavily API Key，申请地址：https://tavily.com，通过环境变量注入
+  max_results: 5  # 每次搜索返回最大结果数
+
+# MCP 配置
+mcp:
+  enabled: true           # 是否启用 MCP SQL 服务器（false 则直连 SQLite）
+  server_timeout: 30      # MCP 服务器超时（秒）
