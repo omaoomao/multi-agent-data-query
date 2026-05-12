@@ -1366,6 +1366,29 @@ class MasterAgent:
             self._push_event("error", message=err_msg)
             self._push_event("done", answer=err_msg)
 
+        # 检测导出意图：用户要求导出 PDF 报告
+        export_keywords = ("导出", "生成报告", "下载报告", "pdf", "PDF", "打印报告", "导出报告")
+        if any(kw in question for kw in export_keywords):
+            self._push_event("status", message="正在生成 PDF 报告...")
+            try:
+                report_result = self.analysis_agent.export_report(
+                    title=question[:30],
+                    analysis_text=analysis_data or "",
+                    table_headers=list(sql_data[0].keys()) if sql_data and isinstance(sql_data[0], dict) else None,
+                    table_rows=sql_data if sql_data else None,
+                    sql_query=state.get("sql_result", {}).get("sql", "") if state.get("sql_result") else "",
+                )
+                if report_result.get("path"):
+                    report_msg = f"\n\nPDF 报告已生成：{report_result['path']}"
+                    state["final_answer"] = (state.get("final_answer") or "") + report_msg
+                    self._push_event("report", path=report_result["path"])
+                elif report_result.get("error"):
+                    err_msg = f"\n\n报告导出失败：{report_result['error']}"
+                    state["final_answer"] = (state.get("final_answer") or "") + err_msg
+                    self._push_event("error", message=report_result["error"])
+            except Exception as e:
+                logger.error(f"[Report] 导出异常: {e}")
+
         return state
     
     def query(self, question: str, thread_id: str = "default", user_id: Optional[str] = None) -> str:

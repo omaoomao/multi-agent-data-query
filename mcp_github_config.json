@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "github-server": {
+      "command": "D:/software/anaconda3/envs/nlp/python.exe",
+      "args": ["D:/workspace/python/ai/00item/Multi-Agent-Exp-main/mcp_github_server.py"],
+      "env": {
+        "GITHUB_TOKEN": "your_github_token_here"
+      }
+    }
+  }
+}
