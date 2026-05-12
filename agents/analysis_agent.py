@@ -2,9 +2,11 @@
 数据分析子智能体
 
 负责对查询结果进行深度分析，生成洞察和建议，并自动生成 ECharts 图表配置。
+支持 skill 增强：smart-chart（智能图表选择）和 report-export（PDF 报告导出）。
 """
 
 import json
+import os
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 
@@ -15,13 +17,22 @@ import logging
 logger = logging.getLogger(__name__)
 sys.path.append(str(Path(__file__).parent.parent))
 from prompts import get_analysis_prompt, get_chart_config_prompt
+from agents.skill_loader import SkillLoader
 
 
 class DataAnalysisAgent:
-    """数据分析子智能体，支持文字分析和 ECharts 图表可视化"""
-    
+    """数据分析子智能体，支持文字分析、ECharts 图表可视化和 PDF 报告导出"""
+
     def __init__(self, llm: BaseLLM):
         self.llm = llm
+
+        # 加载 skills
+        self.skill_loader = SkillLoader()
+        self._smart_chart_skill = self.skill_loader.get_content("smart-chart")
+        self._report_export_skill = self.skill_loader.get_content("report-export")
+        loaded = [n for n in ("smart-chart", "report-export") if self.skill_loader.get_content(n)]
+        if loaded:
+            logger.info(f"[Skills] DataAnalysisAgent 已加载 skills: {loaded}")
     
     @staticmethod
     def _llm_to_str(result) -> str:
@@ -89,15 +100,16 @@ class DataAnalysisAgent:
     
     def _generate_chart_config(self, data: Any, data_summary: str, context: str = "") -> Optional[Dict]:
         """生成 ECharts 图表配置
-        
+
         让 LLM 根据数据特征自动选择图表类型（柱状图/折线图/饼图）
-        并生成完整的 ECharts option 配置对象。
-        
+        并生成完整的 ECharts option 配置对象。如果 smart-chart skill
+        已加载，会将图表选择决策树和模板注入 prompt 以提升图表质量。
+
         Args:
             data: 解析后的数据
             data_summary: 数据摘要
             context: 上下文信息
-            
+
         Returns:
             ECharts option 配置字典，或 None（生成失败时）
         """
@@ -108,6 +120,14 @@ class DataAnalysisAgent:
                 raw_data=raw_data_str,
                 context=context
             )
+
+            # 注入 smart-chart skill：图表选择决策树 + 模板 + 配色
+            if self._smart_chart_skill:
+                prompt = (
+                    f"{prompt}\n\n"
+                    f"=== 图表生成指南（请严格遵循）===\n"
+                    f"{self._smart_chart_skill}"
+                )
             
             chart_json_str = self._llm_to_str(self.llm.invoke(prompt)).strip()
             
@@ -178,9 +198,212 @@ class DataAnalysisAgent:
             if self._should_generate_chart(parsed_data):
                 chart_config = self._generate_chart_config(parsed_data, data_summary, context)
                 result["chart"] = chart_config
-            
+
         except Exception as e:
             result["error"] = f"分析失败: {str(e)}"
-        
+
         return result
 
+    def export_report(
+        self,
+        title: str,
+        analysis_text: str = "",
+        table_headers: list = None,
+        table_rows: list = None,
+        findings: list = None,
+        sql_query: str = "",
+        output_dir: str = "reports"
+    ) -> Dict[str, Any]:
+        """将分析结果导出为 PDF 报告。
+
+        依赖 report-export skill 中的模板。需要安装 fpdf2：
+            pip install fpdf2
+
+        Args:
+            title: 报告标题
+            analysis_text: 分析正文
+            table_headers: 数据表头
+            table_rows: 数据行
+            findings: 关键发现列表
+            sql_query: 使用的 SQL 查询
+            output_dir: 报告输出目录
+
+        Returns:
+            {"path": 文件路径} 或 {"error": 错误信息}
+        """
+        if not self._report_export_skill:
+            return {"error": "report-export skill 未加载，无法导出报告"}
+
+        try:
+            from fpdf import FPDF
+        except ImportError:
+            return {"error": "缺少 fpdf2 依赖，请执行: pip install fpdf2"}
+
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_title = title[:20].replace(" ", "_").replace("/", "_")
+            output_path = os.path.join(output_dir, f"{safe_title}_{timestamp}.pdf")
+
+            # 让 LLM 基于 report-export skill 生成报告内容的结构化摘要
+            skill_guide = self._report_export_skill[:3000]  # 控制长度
+            summarize_prompt = f"""请根据以下分析内容，生成一份结构化报告摘要（用于PDF导出）。
+
+标题：{title}
+分析内容：
+{analysis_text[:3000]}
+
+请返回 JSON 格式（不要代码块）：
+{{"subtitle":"副标题","findings":["发现1","发现2","发现3"],"summary":"一段总结（100字内）"}}
+
+只返回JSON，不要解释。"""
+
+            raw = self.llm.invoke(summarize_prompt)
+            meta_str = self._llm_to_str(raw).strip()
+            # 清理可能的代码块
+            if meta_str.startswith("```"):
+                meta_str = meta_str.split("\n", 1)[1] if "\n" in meta_str else meta_str[3:]
+            if meta_str.endswith("```"):
+                meta_str = meta_str[:-3]
+            meta_str = meta_str.strip()
+
+            try:
+                meta = json.loads(meta_str)
+            except Exception:
+                meta = {"subtitle": "", "findings": findings or [], "summary": ""}
+
+            # 使用 fpdf2 生成 PDF
+            pdf = self._create_pdf_report(
+                title=title,
+                subtitle=meta.get("subtitle", ""),
+                findings=meta.get("findings", findings or []),
+                analysis_text=analysis_text,
+                table_headers=table_headers,
+                table_rows=table_rows,
+                sql_query=sql_query,
+            )
+
+            pdf.output(output_path)
+            logger.info(f"[Report] PDF 已生成: {output_path}")
+            return {"path": output_path}
+
+        except Exception as e:
+            error_msg = f"PDF 导出失败: {str(e)}"
+            logger.error(f"[Report] {error_msg}")
+            return {"error": error_msg}
+
+    @staticmethod
+    def _create_pdf_report(
+        title: str,
+        subtitle: str = "",
+        findings: list = None,
+        analysis_text: str = "",
+        table_headers: list = None,
+        table_rows: list = None,
+        sql_query: str = "",
+    ):
+        """创建 PDF 报告对象（基于 fpdf2）"""
+        from fpdf import FPDF
+        from datetime import datetime
+
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=20)
+
+        # 尝试加载中文字体
+        font_name = "Helvetica"
+        font_dir = os.path.join(os.path.dirname(__file__), "..", "skills", "report-export", "fonts")
+        noto_regular = os.path.join(font_dir, "NotoSansSC-Regular.ttf")
+        noto_bold = os.path.join(font_dir, "NotoSansSC-Bold.ttf")
+        if os.path.exists(noto_regular):
+            pdf.add_font("NotoSansSC", "", noto_regular, uni=True)
+            if os.path.exists(noto_bold):
+                pdf.add_font("NotoSansSC", "B", noto_bold, uni=True)
+            font_name = "NotoSansSC"
+
+        # --- 封面 ---
+        pdf.add_page()
+        pdf.ln(50)
+        pdf.set_font(font_name, "B", 24)
+        pdf.multi_cell(0, 12, title, align="C")
+        if subtitle:
+            pdf.ln(8)
+            pdf.set_font(font_name, "", 13)
+            pdf.set_text_color(108, 117, 125)
+            pdf.multi_cell(0, 8, subtitle, align="C")
+        pdf.ln(20)
+        pdf.set_font(font_name, "", 10)
+        pdf.set_text_color(108, 117, 125)
+        gen_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+        pdf.cell(0, 8, f"Generated: {gen_time}", align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 8, "Source: University Enrollment & Employment Database", align="C")
+
+        # --- 关键发现 ---
+        if findings:
+            pdf.add_page()
+            pdf.set_text_color(33, 37, 41)
+            pdf.set_font(font_name, "B", 16)
+            pdf.cell(0, 10, "Key Findings", new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(4)
+            pdf.set_font(font_name, "", 11)
+            for i, f in enumerate(findings, 1):
+                pdf.set_font(font_name, "B", 11)
+                pdf.cell(8, 7, f"{i}.")
+                pdf.set_font(font_name, "", 11)
+                pdf.multi_cell(0, 7, str(f))
+                pdf.ln(2)
+
+        # --- 数据表格 ---
+        if table_headers and table_rows:
+            pdf.add_page()
+            pdf.set_text_color(33, 37, 41)
+            pdf.set_font(font_name, "B", 16)
+            pdf.cell(0, 10, "Data", new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(4)
+
+            col_w = (pdf.w - 20) / len(table_headers)
+            # 表头
+            pdf.set_font(font_name, "B", 8)
+            pdf.set_fill_color(0, 123, 255)
+            pdf.set_text_color(255, 255, 255)
+            for h in table_headers:
+                pdf.cell(col_w, 7, str(h), border=1, fill=True, align="C")
+            pdf.ln()
+            # 数据行
+            pdf.set_font(font_name, "", 8)
+            pdf.set_text_color(33, 37, 41)
+            for row_idx, row in enumerate(table_rows[:30]):  # 最多30行
+                if pdf.get_y() > 260:
+                    pdf.add_page()
+                if row_idx % 2 == 0:
+                    pdf.set_fill_color(248, 249, 250)
+                else:
+                    pdf.set_fill_color(255, 255, 255)
+                if isinstance(row, dict):
+                    vals = [str(row.get(h, ""))[:12] for h in table_headers]
+                else:
+                    vals = [str(v)[:12] for v in row]
+                for v in vals:
+                    pdf.cell(col_w, 6, v, border=1, fill=True, align="C")
+                pdf.ln()
+
+        # --- 分析 ---
+        if analysis_text:
+            pdf.add_page()
+            pdf.set_text_color(33, 37, 41)
+            pdf.set_font(font_name, "B", 16)
+            pdf.cell(0, 10, "Analysis", new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(4)
+            pdf.set_font(font_name, "", 10)
+            pdf.multi_cell(0, 6, analysis_text)
+
+        # --- 附录 ---
+        if sql_query:
+            pdf.ln(10)
+            pdf.set_font(font_name, "B", 12)
+            pdf.cell(0, 8, "Appendix: SQL Query", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font(font_name, "", 9)
+            pdf.set_fill_color(245, 245, 245)
+            pdf.multi_cell(0, 5, sql_query, fill=True)
+
+        return pdf
