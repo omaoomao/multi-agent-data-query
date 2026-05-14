@@ -98,22 +98,35 @@ school_employment_stats（独立，按专业/年份统计招生就业）
 
 ### 6. 长期记忆系统（LongTermMemory）
 
-- SQLite 持久化，跨会话保留用户偏好和知识
-- 自动提取：对话 ≥ 6 条消息时触发 LLM 提取
+- **ChromaDB** 向量数据库持久化，跨会话保留用户偏好和知识
+- 自动提取：对话 ≥ 10 条消息时触发 LLM 提取（5 分钟冷却）
 - 意图识别时注入用户历史上下文，实现个性化回答
-- **兜底日志**：意图识别失败时自动记录到 `intent_fallback_log` 表，用于后续优化
-- FTS5 全文检索：支持对用户知识的语义搜索
+- 语义去重：余弦相似度 ≥ 0.9 的知识自动合并，避免重复存储
+- 知识容量控制：每用户上限可配置（默认 100 条），溢出时淘汰最早+最低置信度条目
 
-存储结构（4 张表）：
+### 7. 会话状态持久化（SqliteSaver）
 
-| 表 | 用途 |
-|---|---|
-| `users` | 用户基本信息 |
-| `user_preferences` | 用户偏好（键值对） |
-| `user_knowledge` | 用户知识（分类 + 置信度） |
-| `intent_fallback_log` | 意图识别兜底日志 |
+- 使用 `langgraph-checkpoint-sqlite` 将 LangGraph 会话状态持久化到 `data/checkpoints.db`
+- **跨轮次状态传递**：`sql_result` / `analysis_result` / `search_result` 在服务重启后不丢失
+- 支持 `analysis_only` 等依赖上一轮结果的意图在重启后正常工作
+- 长期记忆（ChromaDB）+ 会话状态（SQLite）两层持久化互不干扰
 
-### 7. 流式输出
+### 8. SQL 安全加固
+
+对 SQL 执行进行了三层安全防护：
+
+| 检查项 | 说明 |
+|--------|------|
+| 前缀白名单 | 仅允许 `SELECT` / `EXPLAIN` / `WITH` |
+| 多语句注入检测 | 移除注释和字符串后检测分号，阻止 `SELECT x; DROP TABLE y` |
+| 危险关键字黑名单 | 拦截 `DROP` / `DELETE` / `UPDATE` / `INSERT` / `ALTER` / `ATTACH` / `PRAGMA` 等 |
+| 查询超时 | `set_progress_handler` + 5s 超时，防止恶意/笨重查询拖死数据库 |
+| 只读连接 | SQLite `?mode=ro` URI，文件级别只读 |
+| 行数限制 | 最大返回 1000 行，超限截断 |
+
+以上防护在 MCP Server 和直连 SQLite 两条路径上同步生效。
+
+### 9. 流式输出
 
 支持 SSE（Server-Sent Events）实时推送：
 
@@ -150,15 +163,16 @@ $env:TAVILY_API_KEY = "your_tavily_key"
 ```
 
 > Tavily API Key 申请：[https://app.tavily.com](https://app.tavily.com)，免费套餐每月 1000 次请求。
-> 也可在 `config/config.yaml` 的 `search.tavily_api_key` 字段直接填写。
+> 也可在项目根目录 `.env` 文件或 `config/config.yaml` 中直接填写密钥。
 
 ### 3. 初始化数据库
 
 ```bash
 python data/init_school_db.py          # 初始化高校演示数据库
 python data/init_school_extra_tables.py # 初始化扩展表（学生/教师/课程/成绩/实习/就业）
-python data/init_memory_db.py          # 初始化长期记忆数据库
 ```
+
+> 首次运行时若数据库不存在，系统会自动尝试初始化。
 
 ### 4. 启动 Web 前端
 
@@ -205,10 +219,12 @@ nl2sql:
   num_examples: 3          # Few-shot 示例数量
 
 memory:
-  long_term_db: "./data/long_term_memory.db"
-  short_term_max_tokens: 1000    # Layer 2 触发阈值
+  chroma_path: "./data/chroma_db"         # ChromaDB 向量数据库路径
+  checkpoint_path: "./data/checkpoints.db" # 会话状态持久化（SqliteSaver）
+  max_knowledge_per_user: 100             # 每用户知识条目上限
+  short_term_max_tokens: 1000             # Layer 2 触发阈值
   compression_threshold: 10
-  auto_extract_knowledge: true   # 自动提取用户知识
+  auto_extract_knowledge: true
 
 search:
   tavily_api_key: "${TAVILY_API_KEY}"
@@ -459,7 +475,7 @@ Multi-Agent-Exp-main/
 ├── agents/                          # 智能体模块
 │   ├── __init__.py
 │   ├── master_agent.py             # 主智能体（意图识别 / 路由 / 记忆 / 汇总）
-│   ├── sql_agent.py                # SQL 查询子智能体（含自动纠错）
+│   ├── sql_agent.py                # SQL 查询子智能体（含自动纠错 + 安全校验）
 │   ├── analysis_agent.py           # 数据分析子智能体（含 ECharts）
 │   ├── search_agent.py             # 联网搜索子智能体（Tavily）
 │   ├── answer_sample_agent.py      # 闲聊/工具调用子智能体
@@ -468,14 +484,14 @@ Multi-Agent-Exp-main/
 │   ├── skill_loader.py             # 技能加载器
 │   └── _utils.py                   # 共享工具函数
 ├── memory/                          # 记忆模块
-│   ├── long_term_memory.py         # 长期记忆管理器（SQLite + FTS5）
+│   ├── long_term_memory.py         # 长期记忆管理器（ChromaDB 向量数据库）
 │   └── memory_extractor.py         # 记忆提取器（LLM 自动提取）
 ├── data/                            # 数据模块
 │   ├── school_demo.db              # 高校演示数据库（7 张表）
-│   ├── long_term_memory.db         # 长期记忆数据库（4 张表）
+│   ├── chroma_db/                  # ChromaDB 向量数据库（长期记忆）
+│   ├── checkpoints.db              # 会话状态持久化（SqliteSaver）
 │   ├── init_school_db.py           # 高校数据库初始化
 │   ├── init_school_extra_tables.py # 扩展表初始化（学生/教师/课程等）
-│   ├── init_memory_db.py           # 记忆数据库初始化
 │   └── school_demo_employment_data.csv  # 招生就业原始数据
 ├── config/
 │   └── config.yaml                 # 配置文件
@@ -484,11 +500,17 @@ Multi-Agent-Exp-main/
 │   ├── style.css                   # 样式
 │   └── app.js                      # 前端逻辑（SSE / ECharts）
 ├── skills/                          # 技能定义
+│   ├── smart-chart/SKILL.md         # 图表类型选择决策树 + ECharts 模板
+│   └── report-export/SKILL.md       # PDF 报告生成模板
 ├── tests/                           # 测试
+│   └── test_answer_sample_agent.py  # AnswerSampleAgent 单元测试
 ├── agent.py                         # 主入口（MultiAgentSystem 类）
 ├── app.py                           # Flask Web API 服务
+├── .env                             # 环境变量（API 密钥）
 ├── prompts.py                       # 提示词定义
 ├── mcp_sql_server.py                # MCP SQL 服务器
+├── mcp_github_server.py             # MCP GitHub 服务器（可选）
+├── mcp_github_config.json           # GitHub MCP 连接配置
 ├── start_web.bat                    # Windows 启动脚本
 ├── start_web.sh                     # Linux/Mac 启动脚本
 └── requirements.txt                 # Python 依赖
@@ -503,7 +525,9 @@ Multi-Agent-Exp-main/
 | 大语言模型 | 通义千问（qwen-turbo-latest） |
 | 联网搜索 | Tavily（langchain-tavily） |
 | 数据库协议 | MCP（Model Context Protocol） |
-| 数据存储 | SQLite + FTS5 全文检索 |
+| 业务数据存储 | SQLite（只读连接） |
+| 长期记忆 | ChromaDB（向量数据库） |
+| 会话状态持久化 | langgraph-checkpoint-sqlite |
 | Web 框架 | Flask + Flask-CORS |
 | 前端可视化 | ECharts、marked.js、highlight.js |
 | 终端美化 | Rich |
@@ -514,4 +538,5 @@ Multi-Agent-Exp-main/
 - 联网搜索需额外设置 `TAVILY_API_KEY`（不配置不影响其他功能）
 - 初次运行前需执行数据库初始化脚本
 - 使用相同的 `user_id` 可跨会话保留个人偏好
-- 长期记忆数据库建议定期备份（`data/long_term_memory.db`）
+- 会话状态持久化到 `data/checkpoints.db`，重启后多轮上下文不丢失
+- 长期记忆存储在 `data/chroma_db/`，建议定期备份
