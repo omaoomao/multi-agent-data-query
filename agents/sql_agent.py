@@ -48,6 +48,11 @@ class SQLQueryAgent:
         return one_line[:max_len] + " ..."
 
     @staticmethod
+    def _query_timeout_handler():
+        """SQLite 进度回调，用于中断超时查询。"""
+        raise sqlite3.OperationalError("查询执行超时")
+
+    @staticmethod
     def _llm_to_str(result) -> str:
         """安全地从 LLM 返回值中提取文本，清理思考标签"""
         from agents._utils import llm_to_str
@@ -260,17 +265,49 @@ class SQLQueryAgent:
     _ALLOWED_PREFIXES = ("SELECT", "EXPLAIN", "WITH")
     # 单次查询最大返回行数
     _MAX_ROWS = 1000
+    # 查询超时（毫秒）
+    _QUERY_TIMEOUT_MS = 5000
 
     @staticmethod
     def _validate_sql(sql: str) -> str | None:
-        """校验 SQL 是否在白名单内。返回 None 表示通过，否则返回错误信息。"""
+        """校验 SQL 安全性。返回 None 表示通过，否则返回错误信息。
+
+        检查项：
+        1. 白名单前缀（仅 SELECT / EXPLAIN / WITH）
+        2. 移除注释和字符串后，检测分号（防多语句注入）
+        3. 危险关键字黑名单
+        """
         if not sql or not sql.strip():
             return "SQL 语句不能为空"
+
+        # 移除单行注释
         cleaned = re.sub(r"--[^\n]*", " ", sql)
+        # 移除多行注释
         cleaned = re.sub(r"/\*.*?\*/", " ", cleaned, flags=re.DOTALL)
+        # 移除字符串字面量（防止 'xxx;yyy' 中的分号误判）
+        cleaned = re.sub(r"'[^']*'", "''", cleaned)
+        cleaned = re.sub(r'"[^"]*"', '""', cleaned)
+
+        # 前缀白名单
         first_word = cleaned.strip().split()[0].upper() if cleaned.strip() else ""
         if first_word not in SQLQueryAgent._ALLOWED_PREFIXES:
             return f"只允许 {', '.join(SQLQueryAgent._ALLOWED_PREFIXES)} 查询，收到: {first_word}"
+
+        # 多语句注入检测
+        stripped = cleaned.strip().rstrip(";").strip()
+        if ";" in stripped:
+            return "检测到多语句（分号分隔），拒绝执行。请只提交单条 SQL。"
+
+        # 危险关键字黑名单
+        cleaned_upper = cleaned.upper()
+        dangerous = (
+            "DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "CREATE",
+            "REPLACE", "TRUNCATE", "ATTACH", "DETACH", "PRAGMA",
+        )
+        for kw in dangerous:
+            if re.search(rf'\b{kw}\b', cleaned_upper):
+                return f"检测到危险关键字 '{kw}'，拒绝执行。"
+
         return None
 
     def _execute_sql_direct(self, sql: str) -> str:
@@ -290,6 +327,8 @@ class SQLQueryAgent:
 
         try:
             conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.set_progress_handler(self._query_timeout_handler, 100000)
             cursor = conn.cursor()
             cursor.execute(sql)
             rows = cursor.fetchmany(self._MAX_ROWS + 1)
@@ -307,7 +346,9 @@ class SQLQueryAgent:
             else:
                 return json.dumps({"data": [], "row_count": 0}, ensure_ascii=False)
 
-        except sqlite3.Error as e:
+        except sqlite3.OperationalError as e:
+            if "超时" in str(e):
+                return json.dumps({"error": f"查询执行超时（>{self._QUERY_TIMEOUT_MS}ms），请简化查询条件"}, ensure_ascii=False)
             return json.dumps({"error": f"SQL 执行错误: {e}"}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"error": f"未知错误: {e}"}, ensure_ascii=False)

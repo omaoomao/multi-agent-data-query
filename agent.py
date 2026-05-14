@@ -8,7 +8,7 @@ LangGraph智能问答Agent - 多智能体版本
 - 子智能体2：DataAnalysisAgent（数据分析）
 
 支持长短期记忆：
-- 短期记忆：MemorySaver（会话内对话历史）
+- 短期记忆：SqliteSaver（会话内对话历史，持久化到 SQLite）
 - 长期记忆：LongTermMemory（跨会话用户偏好和知识）
 """
 
@@ -60,6 +60,7 @@ class MultiAgentSystem:
         memory_config = self.config.get("memory", {})
         short_term_max_tokens = memory_config.get("short_term_max_tokens", 1000)
         chroma_path = memory_config.get("chroma_path", "./data/chroma_db")
+        checkpoint_path = memory_config.get("checkpoint_path", "./data/checkpoints.db")
         max_knowledge_per_user = memory_config.get("max_knowledge_per_user", 100)
 
         # 联网搜索配置
@@ -74,6 +75,7 @@ class MultiAgentSystem:
             short_term_max_tokens=short_term_max_tokens,  # 短期记忆最大Token数
             tavily_api_key=tavily_api_key,  # 联网搜索API Key
             chroma_path=chroma_path,  # ChromaDB 向量数据库路径
+            checkpoint_path=checkpoint_path,  # 会话状态持久化路径
             max_knowledge_per_user=max_knowledge_per_user,  # 每用户知识上限
         )
         

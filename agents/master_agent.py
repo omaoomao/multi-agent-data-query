@@ -15,7 +15,7 @@ from typing import TypedDict, Sequence, Dict, Any, Optional, Annotated, Generato
 from pathlib import Path
 
 from langgraph.graph import StateGraph, END, add_messages
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain.messages import HumanMessage, AIMessage
 from langchain_core.messages import BaseMessage
 from langchain_core.language_models import BaseLLM
@@ -215,6 +215,7 @@ class MasterAgent:
                 short_term_max_tokens: int = 1000,
                 tavily_api_key: str = "",
                 chroma_path: str = "./data/chroma_db",
+                checkpoint_path: str = "./data/checkpoints.db",
                 max_knowledge_per_user: int = 100):
         """初始化主智能体
 
@@ -225,6 +226,7 @@ class MasterAgent:
             short_term_max_tokens: 短期记忆最大token数
             tavily_api_key: Tavily 搜索 API Key
             chroma_path: ChromaDB 向量数据库路径
+            checkpoint_path: 会话状态持久化 SQLite 路径
             max_knowledge_per_user: 每用户知识条目上限
         """
         self.llm = llm
@@ -236,8 +238,12 @@ class MasterAgent:
         self.analysis_agent = DataAnalysisAgent(llm)
         self.search_agent = WebSearchAgent(llm, tavily_api_key=tavily_api_key)
 
-        # 初始化短期记忆（MemorySaver）
-        self.memory = MemorySaver()
+        # 初始化会话状态持久化（SqliteSaver 替代 MemorySaver）
+        # 服务重启后 sql_result / analysis_result / search_result 不会丢失
+        cp_path = Path(checkpoint_path)
+        cp_path.parent.mkdir(parents=True, exist_ok=True)
+        self._checkpoint_conn = SqliteSaver.from_conn_string(str(cp_path))
+        self.memory = self._checkpoint_conn
 
         # 初始化长期记忆（LongTermMemory + ChromaDB）
         self.long_term_memory = LongTermMemory(
@@ -880,33 +886,21 @@ class MasterAgent:
         return state
 
     def _call_search_quick_node(self, state: MasterAgentState) -> MasterAgentState:
-        """快速搜索节点：快速联网搜索即时信息，不需要深度整理"""
-        question = state["user_question"]
-        self._push_event("status", message="正在搜索...")
-
-        try:
-            result = self.search_agent.search(question)
-            state["search_result"] = result
-            state["metadata"]["search_result"] = result
-
-            if result.get("error"):
-                self._push_event("error", message=f"搜索出错: {result['error']}")
-        except Exception as e:
-            state["error"] = f"快速搜索失败: {str(e)}"
-            state["search_result"] = {"error": str(e)}
-
+        """快速搜索节点"""
+        self._do_search(state)
         return state
 
-    def _call_sql_node(self, state: MasterAgentState) -> MasterAgentState:
-        """调用SQL查询子智能体"""
-        question = state["user_question"]
+    # ------------------------------------------------------------------
+    # 原子操作方法（被多个节点复用，消除重复逻辑）
+    # ------------------------------------------------------------------
 
+    def _do_sql(self, state: MasterAgentState):
+        """执行 SQL 查询并写入 state。供 call_sql / call_both / call_search_and_sql 复用。"""
         self._push_event("status", message="正在查询数据库...")
         try:
-            result = self.sql_agent.query(question)
+            result = self.sql_agent.query(state["user_question"])
             state["sql_result"] = result
             state["metadata"]["sql_result"] = result
-
             if result.get("sql"):
                 self._push_event("sql", sql=result["sql"], retry_count=result.get("retry_count", 0))
             if result.get("error"):
@@ -915,114 +909,87 @@ class MasterAgent:
             state["error"] = f"SQL查询失败: {str(e)}"
             state["sql_result"] = {"error": str(e)}
 
-        return state
-    
-    def _call_analysis_node(self, state: MasterAgentState) -> MasterAgentState:
-        """调用数据分析子智能体"""
-        question = state["user_question"]
-
+    def _do_analysis(self, state: MasterAgentState):
+        """执行数据分析并写入 state。供 call_analysis / call_both / call_analysis_quick 复用。"""
         self._push_event("status", message="正在分析数据...")
-
         sql_result = state.get("sql_result")
         if not sql_result or "data" not in sql_result:
             state["error"] = "没有找到可以分析的数据。请先进行数据查询。"
             state["analysis_result"] = {"error": "无可用数据"}
             self._push_event("error", message="没有可分析的数据，请先执行数据查询")
-            return state
-
+            return
         try:
-            result = self.analysis_agent.analyze(sql_result["data"], question)
+            result = self.analysis_agent.analyze(sql_result["data"], state["user_question"])
             state["analysis_result"] = result
             state["metadata"]["analysis_result"] = result
             if result.get("chart"):
                 self._push_event("chart", config=result["chart"])
+            if result.get("error"):
+                state["error"] = f"数据分析失败: {result['error']}"
         except Exception as e:
             state["error"] = f"数据分析失败: {str(e)}"
             state["analysis_result"] = {"error": str(e)}
 
+    def _do_search(self, state: MasterAgentState):
+        """执行联网搜索并写入 state。供 call_web_search / call_search_and_sql 复用。"""
+        self._push_event("status", message="正在联网搜索...")
+        try:
+            result = self.search_agent.search(state["user_question"])
+            state["search_result"] = result
+            state["metadata"]["search_result"] = result
+            if result.get("sources"):
+                self._push_event("sources", sources=result["sources"])
+            if result.get("error"):
+                state["error"] = result["error"]
+                self._push_event("error", message=result["error"])
+        except Exception as e:
+            state["error"] = f"联网搜索失败: {str(e)}"
+            state["search_result"] = {"error": str(e)}
+
+    # ------------------------------------------------------------------
+    # 图节点（只做编排，不再内联业务逻辑）
+    # ------------------------------------------------------------------
+
+    def _call_sql_node(self, state: MasterAgentState) -> MasterAgentState:
+        """SQL 查询节点"""
+        self._do_sql(state)
+        return state
+    
+    def _call_analysis_node(self, state: MasterAgentState) -> MasterAgentState:
+        """数据分析节点（使用上一轮 sql_result）"""
+        self._do_analysis(state)
         return state
     
     def _call_both_node(self, state: MasterAgentState) -> MasterAgentState:
-        """先调用SQL查询，再调用数据分析"""
-        question = state["user_question"]
-
-        try:
-            self._push_event("status", message="正在查询数据库...")
-            sql_result = self.sql_agent.query(question)
-            state["sql_result"] = sql_result
-            state["metadata"]["sql_result"] = sql_result
-
-            if sql_result.get("sql"):
-                self._push_event("sql", sql=sql_result["sql"], retry_count=sql_result.get("retry_count", 0))
-            if sql_result.get("error"):
-                state["error"] = f"SQL查询失败: {sql_result['error']}"
-                self._push_event("error", message=f"数据库查询出错: {sql_result['error']}")
-                return state
-
-            if sql_result.get("data"):
-                self._push_event("status", message="正在分析数据...")
-                analysis_result = self.analysis_agent.analyze(sql_result["data"], question)
-                state["analysis_result"] = analysis_result
-                state["metadata"]["analysis_result"] = analysis_result
-                if analysis_result.get("chart"):
-                    self._push_event("chart", config=analysis_result["chart"])
-                if analysis_result.get("error"):
-                    state["error"] = f"数据分析失败: {analysis_result['error']}"
-            else:
-                state["error"] = "查询结果为空，无法进行分析"
-
-        except Exception as e:
-            state["error"] = f"执行失败: {str(e)}"
-
+        """SQL 查询 + 数据分析节点"""
+        self._do_sql(state)
+        # SQL 有数据才做分析（部分成功：SQL 成功但分析失败时，sql_result 仍在 state 中）
+        if state.get("sql_result") and state["sql_result"].get("data"):
+            self._do_analysis(state)
         return state
-    
+
     def _call_web_search_node(self, state: MasterAgentState) -> MasterAgentState:
         """联网搜索节点（纯搜索模式）"""
-        question = state["user_question"]
+        self._do_search(state)
+        return state
 
-        self._push_event("status", message="正在联网搜索...")
+    def _call_search_and_sql_node(self, state: MasterAgentState) -> MasterAgentState:
+        """联网搜索 + 数据库查询联合分析节点"""
+        self._do_sql(state)
+        sql_data = (state.get("sql_result") or {}).get("data", "{}") or "{}"
+        # search_and_compare 需要 SQL 数据做对比，走专用方法
+        self._push_event("status", message="正在联网搜索行业数据...")
         try:
-            search_result = self.search_agent.search(question)
+            search_result = self.search_agent.search_and_compare(state["user_question"], sql_data)
             state["search_result"] = search_result
             state["metadata"]["search_result"] = search_result
-
             if search_result.get("sources"):
                 self._push_event("sources", sources=search_result["sources"])
             if search_result.get("error"):
                 state["error"] = search_result["error"]
                 self._push_event("error", message=search_result["error"])
         except Exception as e:
-            state["error"] = f"联网搜索失败: {str(e)}"
-
-        return state
-    
-    def _call_search_and_sql_node(self, state: MasterAgentState) -> MasterAgentState:
-        """联网搜索 + 数据库查询联合分析节点"""
-        question = state["user_question"]
-
-        try:
-            self._push_event("status", message="正在查询数据库...")
-            sql_result = self.sql_agent.query(question)
-            state["sql_result"] = sql_result
-            state["metadata"]["sql_result"] = sql_result
-
-            if sql_result.get("sql"):
-                self._push_event("sql", sql=sql_result["sql"], retry_count=sql_result.get("retry_count", 0))
-
-            self._push_event("status", message="正在联网搜索行业数据...")
-            sql_data = sql_result.get("data", "{}") or "{}"
-            search_result = self.search_agent.search_and_compare(question, sql_data)
-            state["search_result"] = search_result
-            state["metadata"]["search_result"] = search_result
-
-            if search_result.get("sources"):
-                self._push_event("sources", sources=search_result["sources"])
-            if search_result.get("error") and not sql_result.get("error"):
-                state["error"] = search_result["error"]
-                self._push_event("error", message=search_result["error"])
-        except Exception as e:
             state["error"] = f"联合分析失败: {str(e)}"
-
         return state
     
     def _call_system_command_node(self, state: MasterAgentState) -> MasterAgentState:
@@ -1253,7 +1220,10 @@ class MasterAgent:
         return state
 
     def _summarize_node(self, state: MasterAgentState) -> MasterAgentState:
-        """汇总结果节点 — 流式 LLM 输出，通过事件队列推送 token"""
+        """汇总结果节点 — 流式 LLM 输出，通过事件队列推送 token
+
+        支持部分成功：SQL 成功但分析失败时，仍可用 SQL 数据回答。
+        """
         question = state["user_question"]
         intent = state.get("intent", "sql_only")
 
@@ -1266,13 +1236,6 @@ class MasterAgent:
             self._push_event("done", answer=state["final_answer"])
             return state
 
-        if state.get("error"):
-            state["final_answer"] = f"抱歉，处理过程中出现错误：{state['error']}"
-            state["messages"] = list(state["messages"]) + [AIMessage(content=state["final_answer"])]
-            self._push_event("chunk", content=state["final_answer"])
-            self._push_event("done", answer=state["final_answer"])
-            return state
-
         sql_result = state.get("sql_result")
         analysis_result = state.get("analysis_result")
         search_result = state.get("search_result")
@@ -1280,7 +1243,16 @@ class MasterAgent:
         # 联网搜索相关意图：搜索智能体已生成完整回答
         if intent in ("web_search", "search_and_sql") and search_result:
             if search_result.get("error"):
-                answer = f"搜索出错：{search_result['error']}"
+                # 搜索失败但 SQL 可能有数据（search_and_sql 意图）
+                if sql_result and sql_result.get("data") and not sql_result.get("error"):
+                    # 不报搜索错误，交给 LLM 用 SQL 数据回答
+                    pass
+                else:
+                    answer = f"搜索出错：{search_result['error']}"
+                    state["final_answer"] = answer
+                    state["messages"] = list(state["messages"]) + [AIMessage(content=answer)]
+                    self._push_event("done", answer=answer)
+                    return state
             else:
                 answer = search_result.get("answer", "未能获取搜索结果")
                 sources = search_result.get("sources", [])
@@ -1288,37 +1260,36 @@ class MasterAgent:
                     answer += "\n\n**参考来源：**\n" + "\n".join(
                         f"- {url}" for url in sources[:5]
                     )
-            state["final_answer"] = answer
-            state["messages"] = list(state["messages"]) + [AIMessage(content=answer)]
-            self._push_event("chunk", content=answer)
-            self._push_event("done", answer=answer)
-            return state
+                state["final_answer"] = answer
+                state["messages"] = list(state["messages"]) + [AIMessage(content=answer)]
+                self._push_event("chunk", content=answer)
+                self._push_event("done", answer=answer)
+                return state
 
-        # 数据库查询/分析相关意图
+        # 提取可用数据（部分成功模式：某环节失败不阻断其他结果）
         sql_data = None
         analysis_data = None
 
-        if sql_result:
-            if sql_result.get("error"):
-                err = f"查询出错：{sql_result['error']}"
-                state["final_answer"] = err
-                state["messages"] = list(state["messages"]) + [AIMessage(content=err)]
-                self._push_event("error", message=err)
-                self._push_event("done", answer=err)
-                return state
+        if sql_result and not sql_result.get("error"):
             sql_data = sql_result.get("data")
 
         if analysis_result:
             if analysis_result.get("error"):
-                err = f"分析出错：{analysis_result['error']}"
-                state["final_answer"] = err
-                state["messages"] = list(state["messages"]) + [AIMessage(content=err)]
-                self._push_event("error", message=err)
-                self._push_event("done", answer=err)
-                return state
-            analysis_data = analysis_result.get("analysis")
-            if analysis_result.get("chart"):
-                state["metadata"]["chart"] = analysis_result["chart"]
+                # 分析失败不阻断：SQL 数据仍然可用，通知前端但继续
+                self._push_event("error", message=f"数据分析出错（将用查询数据回答）: {analysis_result['error']}")
+            else:
+                analysis_data = analysis_result.get("analysis")
+                if analysis_result.get("chart"):
+                    state["metadata"]["chart"] = analysis_result["chart"]
+
+        # 全部失败时才报错
+        if not sql_data and not analysis_data and not search_result:
+            error_msg = state.get("error", "无法获取有效数据")
+            err = f"抱歉，处理过程中出现错误：{error_msg}"
+            state["final_answer"] = err
+            state["messages"] = list(state["messages"]) + [AIMessage(content=err)]
+            self._push_event("done", answer=err)
+            return state
 
         # 流式生成汇总回答
         try:
